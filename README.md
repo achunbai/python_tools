@@ -1,3 +1,3 @@
-# Python小工具合集
+# Python Utilities Collection
 
-我自用的一些Python小工具，可能AI含有量较高，毕竟我还不会Python，作为存档，方便日后使用，防丢
+A collection of Python utilities I use personally, serving as part of my Python learning achievements. Archived for convenient future use and to prevent loss.

@@ -1,3 +1,3 @@
-# 代理类工具
+# Proxy Tools
 
-- `proxy_server`：方便网抑云启动的小工具，让网抑云流量走外网网卡
+- `proxy_server`: A proxy tool used to verify the feasibility of traffic distribution
