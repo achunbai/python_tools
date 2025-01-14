@@ -1,3 +1,8 @@
 Audio/*.mp3
 Audio/*.pcm
 Audio/*.wav
+web_server/domain/*
+web_server/www
+web_server/log.txt
+!web_server/domain/server/
+!web_server/domain/server/**
