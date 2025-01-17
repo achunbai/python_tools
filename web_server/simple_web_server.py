@@ -14,9 +14,6 @@ import logging
 import sys
 import warnings
 
-# Suppress deprecation warnings from the 'cgi' module
-warnings.filterwarnings("ignore", category=DeprecationWarning, module='cgi')
-
 WWW_DIR = os.path.join(os.getcwd(), 'www')
 DOMAIN_DIR = os.path.join(os.getcwd(), 'domain')
 UPLOAD_DIR = os.path.join(WWW_DIR, 'uploads')
