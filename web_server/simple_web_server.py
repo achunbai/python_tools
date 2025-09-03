@@ -6,13 +6,11 @@ import threading
 import shutil
 from functools import partial
 import base64
-import cgi
 import io
 import re
 import argparse
 import logging
 import sys
-import warnings
 
 WWW_DIR = os.path.join(os.getcwd(), 'www')
 DOMAIN_DIR = os.path.join(os.getcwd(), 'domain')
@@ -70,6 +68,24 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.response_headers = {}
         self.raw_request = ""  # Initialize raw_request
         super().__init__(*args, directory=directory, **kwargs)
+
+    def setup(self):
+        """Wrap the accepted socket with SSL on a per-connection basis if the server has an ssl_context.
+        This ensures the TLS handshake happens in the handler thread, avoiding blocking the accept loop.
+        """
+        # Call base setup to initialize rfile/wfile
+        super().setup()
+        ctx = getattr(self.server, 'ssl_context', None)
+        if ctx:
+            try:
+                # Wrap the raw socket for this connection; handshake will occur here in the handler thread
+                self.request = ctx.wrap_socket(self.request, server_side=True)
+                # Recreate file objects to use the wrapped socket
+                self.rfile = self.request.makefile('rb', buffering=0)
+                self.wfile = self.request.makefile('wb', buffering=0)
+            except Exception as e:
+                logging.error(f"Error during per-connection SSL wrap: {e}")
+                raise
 
     def log_message(self, format, *args):
         """Override to use logging instead of print."""
@@ -245,50 +261,100 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
             logging.info("-----------------------")
 
         if 'multipart/form-data' in content_type:
-            boundary = content_type.split('boundary=')[-1]
+            # Extract boundary (may be quoted)
+            boundary = None
+            for part in content_type.split(';'):
+                part = part.strip()
+                if part.startswith('boundary='):
+                    boundary = part.split('=', 1)[1]
+                    break
             if not boundary:
                 self.send_error(400, "Bad Request: Missing boundary in multipart/form-data")
-                # Log the original request upon error
                 logging.error("----- Original Request -----")
                 logging.error(self.raw_request)
                 logging.error("----------------------------")
                 return
-            environ = {'REQUEST_METHOD': 'POST'}
-            fs = cgi.FieldStorage(
-                fp=io.BytesIO(post_data),
-                headers=self.headers,
-                environ=environ,
-                keep_blank_values=True
-            )
-            if 'file' in fs:
-                file_field = fs['file']
-                if file_field.filename:
-                    filename = os.path.basename(file_field.filename)
+            # Trim optional surrounding quotes
+            if boundary.startswith('"') and boundary.endswith('"'):
+                boundary = boundary[1:-1]
+
+            # Simple multipart parser to avoid reliance on cgi.FieldStorage
+            def parse_multipart(data: bytes, boundary_str: str):
+                b_boundary = ("--" + boundary_str).encode('utf-8')
+                parts = data.split(b_boundary)
+                fields = {}
+                for part in parts:
+                    if not part or part == b'--' or part == b'--\r\n':
+                        continue
+                    # strip leading CRLF
+                    if part.startswith(b'\r\n'):
+                        part = part[2:]
+                    # strip trailing CRLF or trailing --
+                    if part.endswith(b'\r\n'):
+                        part = part[:-2]
+                    if part.endswith(b'--'):
+                        part = part[:-2]
+
+                    header_section, sep, body = part.partition(b'\r\n\r\n')
+                    if sep == b'':
+                        continue
+                    try:
+                        header_text = header_section.decode('utf-8', errors='replace')
+                    except Exception:
+                        header_text = ''
+                    headers = {}
+                    for line in header_text.split('\r\n'):
+                        if ':' in line:
+                            k, v = line.split(':', 1)
+                            headers[k.strip().lower()] = v.strip()
+
+                    disp = headers.get('content-disposition', '')
+                    m_name = re.search(r'name="([^\"]+)"', disp)
+                    name = m_name.group(1) if m_name else None
+                    m_filename = re.search(r'filename="([^\"]+)"', disp)
+                    filename = m_filename.group(1) if m_filename else None
+
+                    fields[name] = {
+                        'filename': filename,
+                        'content': body
+                    }
+                return fields
+
+            try:
+                fields = parse_multipart(post_data, boundary)
+            except Exception as e:
+                logging.error(f"Multipart parse error: {e}")
+                self.send_error(400, "Bad Request: Unable to parse multipart data")
+                logging.error("----- Original Request -----")
+                logging.error(self.raw_request)
+                logging.error("----------------------------")
+                return
+
+            if 'file' in fields:
+                file_field = fields['file']
+                if file_field.get('filename'):
+                    filename = os.path.basename(file_field['filename'])
                     file_path = os.path.join(UPLOAD_DIR, filename)
                     try:
                         with open(file_path, 'wb') as output_file:
-                            file_content = file_field.file.read()
-                            output_file.write(file_content)
+                            output_file.write(file_field.get('content', b''))
                         if self.enable_file_logging:
                             logging.info(f"File saved: {file_path}")
                     except Exception as e:
                         logging.error(f"Error saving file: {e}")
                         self.send_error(500, "Internal Server Error: Unable to save file")
-                        # Log the original request upon error
                         logging.error("----- Original Request -----")
                         logging.error(self.raw_request)
                         logging.error("----------------------------")
                         return
                 else:
                     self.send_error(400, "Bad Request: No filename provided")
-                    # Log the original request upon error
                     logging.error("----- Original Request -----")
                     logging.error(self.raw_request)
                     logging.error("----------------------------")
                     return
             else:
                 self.send_error(400, "Bad Request: No file field in form")
-                # Log the original request upon error
                 logging.error("----- Original Request -----")
                 logging.error(self.raw_request)
                 logging.error("----------------------------")
@@ -349,10 +415,14 @@ def run_https_server(domain, port, log_headers, log_request_data, log_raw_data,
         log_file_path=log_file_path,
         directory=WWW_DIR  # Set directory to WWW_DIR
     )
-    httpd = socketserver.TCPServer(("", port), handler)
+    # Use a threading server so a stalled TLS handshake won't block other clients
+    httpd = socketserver.ThreadingTCPServer(("", port), handler)
+    httpd.allow_reuse_address = True
+    httpd.daemon_threads = True
     context = create_ssl_context(domain)
     if context:
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        # Attach SSLContext to server instance; each handler will wrap its accepted socket
+        httpd.ssl_context = context
         logging.info(f"[HTTPS] Serving on port {port} (Domain='{domain if domain else 'server'}')...")
         httpd.serve_forever()
     else:
@@ -373,7 +443,10 @@ def run_http_server(port, log_headers, log_request_data, log_raw_data,
         log_file_path=log_file_path,
         directory=WWW_DIR  # Set directory to WWW_DIR
     )
-    httpd = socketserver.TCPServer(("", port), handler)
+    # Use a threading server so concurrent clients (or stalled handshakes) won't block
+    httpd = socketserver.ThreadingTCPServer(("", port), handler)
+    httpd.allow_reuse_address = True
+    httpd.daemon_threads = True
     logging.info(f"[HTTP] Serving on port {port}...")
     httpd.serve_forever()
 
